@@ -1,7 +1,7 @@
 interface:
-  display_name: "小志周报"
-  short_description: "静默记录项目会话并按周输出精炼周报"
-  default_prompt: "Use $xiaozhi-worklog to silently sync monitored work sessions or generate the weekly report when I say `小志 提供周报`."
+  display_name: "小志"
+  short_description: "统一查看项目会话索引、周报和工作台信息"
+  default_prompt: "Use $xiaozhi-worklog when I address `小志`, including weekly reports, the report workbench, index status, skill info, and project mapping operations."
 
 policy:
   allow_implicit_invocation: true

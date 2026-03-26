@@ -1,9 +1,17 @@
 {
-  "session_root": "/Users/lh/.codex/sessions",
-  "timezone": "Asia/Shanghai",
-  "monitored_roots": [
-    "/Users/lh/work/funenc"
+  "session_providers": [
+    {
+      "name": "codex",
+      "type": "codex",
+      "root": "/Users/lh/.codex/sessions"
+    },
+    {
+      "name": "claude-code",
+      "type": "claude-code",
+      "root": "/Users/lh/.claude/projects"
+    }
   ],
+  "timezone": "Asia/Shanghai",
   "data_root": "/Users/lh/.codex/memories/xiaozhi-worklog",
   "records_weeks": 2
 }

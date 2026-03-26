@@ -8,14 +8,17 @@ from pathlib import Path
 
 from worklog_lib import (
     archive_staged_report,
+    build_skill_info,
     delete_mapping,
     load_mapping,
     load_json,
+    open_workbench,
     prepare_weekly_source,
     render_weekly_source_markdown,
     resolve_settings,
     save_weekly_report,
     set_mapping,
+    summarize_index_status,
     stage_weekly_report,
     sync_sessions,
     week_id_for,
@@ -39,14 +42,33 @@ def cmd_prepare_report(args):
     now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
     week_id = args.week or week_id_for(now, settings["timezone"])
     source = prepare_weekly_source(
-        records_root=Path(settings["data_root"]) / "records",
         week_id=week_id,
         mapping=mapping,
+        settings=settings,
     )
     if args.format == "json":
         print(json.dumps(source, ensure_ascii=False, indent=2))
         return
     print(render_weekly_source_markdown(source))
+
+
+def cmd_info(args):
+    settings = load_settings_file(args.settings)
+    print(json.dumps(build_skill_info(settings), ensure_ascii=False, indent=2))
+
+
+def cmd_index_status(args):
+    settings = load_settings_file(args.settings)
+    mapping = load_mapping(args.mapping)
+    now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
+    week_id = args.week or week_id_for(now, settings["timezone"])
+    print(
+        json.dumps(
+            summarize_index_status(settings["data_root"], week_id, mapping),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def cmd_save_report(args):
@@ -90,6 +112,27 @@ def cmd_delete_mapping(args):
     print(json.dumps(updated, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def cmd_open_workbench(args):
+    settings = load_settings_file(args.settings)
+    mapping = load_mapping(args.mapping)
+    now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
+    week_id = args.week or week_id_for(now, settings["timezone"])
+    runtime = open_workbench(
+        settings=settings,
+        mapping=mapping,
+        week_id=week_id,
+        host=args.host,
+        port=args.port,
+    )
+    print(json.dumps({"url": runtime["url"], "week": week_id}, ensure_ascii=False), flush=True)
+    try:
+        runtime["server"].serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        runtime["server"].server_close()
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -112,6 +155,18 @@ def build_parser():
     report_parser.add_argument("--now")
     report_parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     report_parser.set_defaults(func=cmd_prepare_report)
+
+    info_parser = subparsers.add_parser("info")
+    info_parser.set_defaults(func=cmd_info)
+
+    index_parser = subparsers.add_parser("index-status")
+    index_parser.add_argument(
+        "--mapping",
+        default=str(Path(__file__).resolve().parent.parent / "report-mapping.json"),
+    )
+    index_parser.add_argument("--week")
+    index_parser.add_argument("--now")
+    index_parser.set_defaults(func=cmd_index_status)
 
     save_parser = subparsers.add_parser("save-report")
     save_parser.add_argument("--week")
@@ -144,6 +199,14 @@ def build_parser():
     delete_mapping_parser.add_argument("--mapping", default=mapping_default)
     delete_mapping_parser.add_argument("--pwd", required=True)
     delete_mapping_parser.set_defaults(func=cmd_delete_mapping)
+
+    workbench_parser = subparsers.add_parser("open-workbench")
+    workbench_parser.add_argument("--mapping", default=mapping_default)
+    workbench_parser.add_argument("--week")
+    workbench_parser.add_argument("--now")
+    workbench_parser.add_argument("--host", default="127.0.0.1")
+    workbench_parser.add_argument("--port", type=int, default=5555)
+    workbench_parser.set_defaults(func=cmd_open_workbench)
 
     return parser
 

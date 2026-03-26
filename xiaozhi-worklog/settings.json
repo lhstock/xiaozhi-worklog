@@ -1,0 +1,9 @@
+{
+  "session_root": "/Users/lh/.codex/sessions",
+  "timezone": "Asia/Shanghai",
+  "monitored_roots": [
+    "/Users/lh/work/funenc"
+  ],
+  "data_root": "/Users/lh/.codex/memories/xiaozhi-worklog",
+  "records_weeks": 2
+}

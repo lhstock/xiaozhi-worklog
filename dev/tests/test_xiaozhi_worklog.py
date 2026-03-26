@@ -7,8 +7,7 @@ from pathlib import Path
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "xiaozhi-worklog"
+    Path(__file__).resolve().parent.parent.parent
     / "scripts"
     / "worklog_lib.py"
 )

@@ -1,11 +1,13 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = (
@@ -210,6 +212,117 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual("codex", resolved["session_providers"][0]["type"])
         self.assertEqual("/tmp/codex-sessions", resolved["session_providers"][0]["root"])
 
+    def test_resolve_settings_expands_user_for_provider_roots(self):
+        module = load_module()
+
+        resolved = module.resolve_settings(
+            {
+                "session_providers": [
+                    {"name": "codex", "type": "codex", "root": "~/.codex/sessions"},
+                    {"name": "claude-code", "type": "claude-code", "root": "~/.claude/projects"},
+                ]
+            }
+        )
+
+        self.assertEqual(str(Path("~/.codex/sessions").expanduser()), resolved["session_providers"][0]["root"])
+        self.assertEqual(str(Path("~/.claude/projects").expanduser()), resolved["session_providers"][1]["root"])
+
+    def test_resolve_settings_expands_user_for_legacy_session_root(self):
+        module = load_module()
+
+        resolved = module.resolve_settings({"session_root": "~/.codex/sessions"})
+
+        self.assertEqual(str(Path("~/.codex/sessions").expanduser()), resolved["session_providers"][0]["root"])
+
+    def test_resolve_settings_defaults_to_project_xiaozhi_layout(self):
+        module = load_module()
+
+        resolved = module.resolve_settings({})
+
+        self.assertTrue(str(resolved["data_root"]).endswith("/.xiaozhi/runtime"))
+        self.assertTrue(str(resolved["git_identity_path"]).endswith("/.xiaozhi/config/git-identity.json"))
+
+    def test_cli_defaults_to_xiaozhi_config_paths(self):
+        module = load_cli_module()
+        parser = module.build_parser()
+
+        args = parser.parse_args(["prepare-report"])
+
+        self.assertTrue(str(args.settings).endswith("/.xiaozhi/config/settings.json"))
+        self.assertTrue(str(args.mapping).endswith("/.xiaozhi/config/report-mapping.json"))
+
+    def test_resolve_settings_reads_runtime_relative_to_config_dir(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / ".xiaozhi" / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+
+            resolved = module.resolve_settings(
+                {
+                    "data_root": "../runtime",
+                    "git_identity_path": "./git-identity.json",
+                },
+                settings_path=str(config_dir / "settings.json"),
+            )
+
+            self.assertEqual(str((config_dir.parent / "runtime").resolve()), resolved["data_root"])
+            self.assertEqual(str((config_dir / "git-identity.json").resolve()), resolved["git_identity_path"])
+
+    def test_resolve_settings_keeps_legacy_project_relative_paths_working_from_config_dir(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".xiaozhi" / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+
+            resolved = module.resolve_settings(
+                {
+                    "data_root": "./.xiaozhi/runtime",
+                    "git_identity_path": "./.xiaozhi/config/git-identity.json",
+                },
+                settings_path=str(config_dir / "settings.json"),
+            )
+
+            self.assertEqual(str((root / ".xiaozhi" / "runtime").resolve()), resolved["data_root"])
+            self.assertEqual(
+                str((root / ".xiaozhi" / "config" / "git-identity.json").resolve()),
+                resolved["git_identity_path"],
+            )
+
+    def test_load_settings_file_falls_back_to_legacy_root_settings(self):
+        module = load_cli_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_settings = root / "settings.json"
+            legacy_settings.write_text(
+                json.dumps(
+                    {
+                        "data_root": "./.xiaozhi/runtime",
+                        "timezone": "Asia/Shanghai",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = module.load_settings_file(str(root / ".xiaozhi" / "config" / "settings.json"))
+
+            self.assertEqual(str((root / ".xiaozhi" / "runtime").resolve()), loaded["data_root"])
+
+    def test_load_mapping_file_falls_back_to_legacy_root_mapping(self):
+        module = load_cli_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_mapping = root / "report-mapping.json"
+            legacy_mapping.write_text(
+                json.dumps({"path_map": {"/a/project": "Alpha"}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            loaded = module.load_mapping_file(str(root / ".xiaozhi" / "config" / "report-mapping.json"))
+
+            self.assertEqual("Alpha", loaded["path_map"]["/a/project"])
+
     def test_open_workbench_defaults_to_port_5555(self):
         module = load_cli_module()
         parser = module.build_parser()
@@ -217,6 +330,15 @@ class SettingsTests(unittest.TestCase):
         args = parser.parse_args(["open-workbench"])
 
         self.assertEqual(5555, args.port)
+
+    def test_resolve_week_spec_supports_relative_and_month_week_formats(self):
+        module = load_module()
+        now = datetime.fromisoformat("2026-03-27T12:00:00+08:00")
+
+        self.assertEqual("2026-W13", module.resolve_week_spec(None, now, "Asia/Shanghai"))
+        self.assertEqual("2026-W13", module.resolve_week_spec("本周", now, "Asia/Shanghai"))
+        self.assertEqual("2026-W12", module.resolve_week_spec("上周", now, "Asia/Shanghai"))
+        self.assertEqual("2026-W10", module.resolve_week_spec("03-w1", now, "Asia/Shanghai"))
 
 
 class SyncTests(unittest.TestCase):
@@ -369,6 +491,74 @@ class SyncTests(unittest.TestCase):
                 ),
             )
 
+    def test_sync_with_subset_provider_config_keeps_other_provider_index_entries(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            codex_root = base / "codex"
+            claude_root = base / "claude"
+            data_root = base / "data"
+            project_path = "/Users/lh/work/project-alpha"
+
+            write_session(
+                codex_root / "2026" / "03" / "25" / "one.jsonl",
+                project_path,
+                "session-1",
+                [
+                    user_message("实现订单页"),
+                    assistant_message("已完成订单页首屏结构。"),
+                ],
+            )
+            write_claude_session(
+                claude_root / "project-alpha" / "claude-1.jsonl",
+                project_path,
+                "claude-1",
+                [
+                    claude_user_message("梳理验收步骤"),
+                    claude_assistant_message("已梳理验收步骤和注意事项。"),
+                ],
+            )
+
+            now = datetime.fromisoformat("2026-03-25T12:00:00+08:00")
+            module.sync_sessions(
+                settings={
+                    "session_providers": [
+                        {"name": "claude-code", "type": "claude-code", "root": str(claude_root)},
+                    ],
+                    "data_root": str(data_root),
+                    "timezone": "Asia/Shanghai",
+                    "records_weeks": 2,
+                },
+                current_cwd="/tmp",
+                now=now,
+            )
+            module.sync_sessions(
+                settings={
+                    "session_providers": [
+                        {"name": "codex", "type": "codex", "root": str(codex_root)},
+                    ],
+                    "data_root": str(data_root),
+                    "timezone": "Asia/Shanghai",
+                    "records_weeks": 2,
+                },
+                current_cwd="/tmp",
+                now=now,
+            )
+
+            index = json.loads(
+                (data_root / "index" / "2026-W13" / "projects.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [
+                    {"provider": "claude-code", "session_id": "claude-1"},
+                    {"provider": "codex", "session_id": "session-1"},
+                ],
+                sorted(
+                    index["projects"][project_path],
+                    key=lambda item: (item["provider"], item["session_id"]),
+                ),
+            )
+
 
 class ReportTests(unittest.TestCase):
     def test_prepare_report_uses_git_as_primary_source_and_sessions_as_supplement(self):
@@ -470,16 +660,34 @@ class ReportTests(unittest.TestCase):
             }
             git(repo, "commit", "-m", "feat: 别人的提交", env=other_env)
 
+            session_root = base / "sessions"
+            data_root = base / "data"
+            write_session(
+                session_root / "2026" / "03" / "25" / "one.jsonl",
+                str(repo),
+                "session-1",
+                [
+                    user_message("整理本周工作"),
+                    assistant_message("已整理本周工作内容。"),
+                ],
+            )
+
             settings = {
-                "session_root": str(base / "sessions"),
-                "data_root": str(base / "data"),
+                "session_root": str(session_root),
+                "data_root": str(data_root),
                 "timezone": "Asia/Shanghai",
                 "records_weeks": 2,
-                "git_identity": {
-                    "emails": ["owner@example.com"],
-                    "names": ["Owner"],
-                },
+                "git_identity_path": str(base / "git-identity.json"),
             }
+            module.save_git_identity_map(
+                settings["git_identity_path"],
+                {"emails": ["owner@example.com"], "names": ["Owner"]},
+            )
+            module.sync_sessions(
+                settings=settings,
+                current_cwd="/tmp",
+                now=datetime.fromisoformat("2026-03-25T12:00:00+08:00"),
+            )
 
             report = module.prepare_weekly_source(
                 week_id="2026-W13",
@@ -490,6 +698,60 @@ class ReportTests(unittest.TestCase):
             commits = report["projects"][0]["git"]["commits"]
             self.assertEqual(1, len(commits))
             self.assertEqual("feat: 完成我的事项", commits[0]["subject"])
+
+    def test_prepare_report_does_not_include_commits_when_git_identity_is_unknown(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "alpha"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.name", "Owner")
+            git(repo, "config", "user.email", "owner@example.com")
+
+            (repo / "mine.txt").write_text("mine\n", encoding="utf-8")
+            git(repo, "add", "mine.txt")
+            own_env = {
+                "GIT_AUTHOR_DATE": "2026-03-24T10:00:00+08:00",
+                "GIT_COMMITTER_DATE": "2026-03-24T10:00:00+08:00",
+                "GIT_AUTHOR_NAME": "Owner",
+                "GIT_AUTHOR_EMAIL": "owner@example.com",
+                "GIT_COMMITTER_NAME": "Owner",
+                "GIT_COMMITTER_EMAIL": "owner@example.com",
+            }
+            git(repo, "commit", "-m", "feat: 完成我的事项", env=own_env)
+
+            module.discover_git_identity_defaults = lambda repo_path=None: {"emails": [], "names": []}
+
+            settings = {
+                "session_root": str(base / "sessions"),
+                "data_root": str(base / "data"),
+                "timezone": "Asia/Shanghai",
+                "records_weeks": 2,
+                "git_identity_path": str(base / "git-identity.json"),
+            }
+            write_session(
+                base / "sessions" / "2026" / "03" / "25" / "one.jsonl",
+                str(repo),
+                "session-1",
+                [
+                    user_message("整理 Alpha"),
+                    assistant_message("已整理 Alpha。"),
+                ],
+            )
+            module.sync_sessions(
+                settings=settings,
+                current_cwd="/tmp",
+                now=datetime.fromisoformat("2026-03-25T12:00:00+08:00"),
+            )
+
+            report = module.prepare_weekly_source(
+                week_id="2026-W13",
+                mapping={"path_map": {str(repo): "Alpha 项目"}},
+                settings=settings,
+            )
+
+            self.assertEqual([], report["projects"][0]["git"]["commits"])
 
     def test_prepare_report_reads_claude_code_sessions(self):
         module = load_module()
@@ -655,6 +917,29 @@ class ReportTests(unittest.TestCase):
         self.assertLessEqual(draft.count("\n1. "), 1)
         self.assertNotIn("实现细节", draft)
 
+    def test_render_weekly_report_draft_avoids_file_names_and_technical_details(self):
+        module = load_module()
+        draft = module.render_weekly_report_draft(
+            {
+                "week": "2026-W13",
+                "projects": [
+                    {
+                        "name": "Alpha 项目",
+                        "paths": ["/tmp/alpha"],
+                        "git": {
+                            "commits": [],
+                            "working_tree": {"modified": ["src/pages/maintenance/DataTable.jsx"], "untracked": ["notes.md"]},
+                        },
+                        "sessions": [],
+                    }
+                ],
+            }
+        )
+
+        self.assertNotIn("DataTable", draft)
+        self.assertNotIn("notes.md", draft)
+        self.assertRegex(draft, r"1\. (完成|优化|推进|完善)")
+
     def test_build_workbench_payload_exposes_draft_info_and_index_status(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -706,19 +991,29 @@ class ReportTests(unittest.TestCase):
             {
                 "week": "2026-W13",
                 "draft": "本周工作内容",
+                "regenerate_note": "",
                 "skill": {"name": "小志", "description": "统一入口"},
                 "index_status": {"projects": []},
                 "source": {"week": "2026-W13", "projects": []},
+                "mapping": {"path_map": {}},
+                "git_identity": {"emails": [], "names": []},
             }
         )
 
         self.assertIn("textarea", html)
         self.assertIn("复制", html)
         self.assertIn("确认归档", html)
+        self.assertIn("后台管理", html)
+        self.assertIn("重新生成补充说明", html)
+        self.assertIn("/api/mapping", html)
+        self.assertIn("/api/git-identity", html)
         self.assertIn("/api/archive", html)
         self.assertNotIn("索引状态", html)
         self.assertNotIn("技能信息", html)
         self.assertNotIn("原始周报来源", html)
+        self.assertIn('id="status"', html)
+        self.assertIn("请求进行中", html)
+        self.assertIn("response.ok", html)
 
     def test_archive_marks_workbench_for_shutdown(self):
         module = load_module()
@@ -741,6 +1036,7 @@ class ReportTests(unittest.TestCase):
             state = module.WorkbenchState(
                 settings=module.resolve_settings(settings),
                 mapping={"path_map": {}},
+                mapping_path=Path(tmp) / "report-mapping.json",
                 week_id="2026-W13",
             )
             module.finalize_workbench_archive(
@@ -749,6 +1045,38 @@ class ReportTests(unittest.TestCase):
             )
 
             self.assertTrue(state.get_payload()["should_close"])
+
+    def test_dispatch_workbench_post_returns_json_error_for_regenerate_failure(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state = module.WorkbenchState(
+                settings=module.resolve_settings(
+                    {
+                        "session_root": str(base / "sessions"),
+                        "data_root": str(base / "data"),
+                        "timezone": "Asia/Shanghai",
+                        "records_weeks": 2,
+                    }
+                ),
+                mapping={"path_map": {}},
+                mapping_path=base / "report-mapping.json",
+                week_id="2026-W13",
+            )
+            with mock.patch.object(
+                module,
+                "regenerate_workbench_draft",
+                side_effect=RuntimeError("regen failed"),
+            ):
+                body, status, should_shutdown = module.dispatch_workbench_post(
+                    state,
+                    "/api/regenerate",
+                    {"note": "测试"},
+                )
+
+            self.assertEqual(500, status)
+            self.assertEqual("regen failed", body["error"])
+            self.assertFalse(should_shutdown)
 
     def test_prepare_report_aggregates_multiple_paths_into_one_project(self):
         module = load_module()
@@ -781,6 +1109,29 @@ class ReportTests(unittest.TestCase):
                 "monitored_roots": [],
                 "records_weeks": 2,
             }
+            write_session(
+                base / "sessions" / "2026" / "03" / "25" / "one.jsonl",
+                str(repo_a),
+                "session-a",
+                [
+                    user_message("推进前台事项"),
+                    assistant_message("已推进前台事项。"),
+                ],
+            )
+            write_session(
+                base / "sessions" / "2026" / "03" / "25" / "two.jsonl",
+                str(repo_b),
+                "session-b",
+                [
+                    user_message("推进管理台事项"),
+                    assistant_message("已推进管理台事项。"),
+                ],
+            )
+            module.sync_sessions(
+                settings=settings,
+                current_cwd="/tmp",
+                now=datetime.fromisoformat("2026-03-25T12:00:00+08:00"),
+            )
 
             report = module.prepare_weekly_source(
                 week_id="2026-W13",
@@ -797,6 +1148,258 @@ class ReportTests(unittest.TestCase):
             project = report["projects"][0]
             self.assertEqual(2, len(project["paths"]))
             self.assertEqual(2, len(project["git"]["commits"]))
+
+    def test_prepare_report_only_includes_mapped_paths_touched_this_week(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            alpha = base / "alpha"
+            beta = base / "beta"
+            for repo, subject in ((alpha, "feat: 完成 Alpha"), (beta, "feat: 完成 Beta")):
+                repo.mkdir()
+                git(repo, "init")
+                git(repo, "config", "user.name", "Tester")
+                git(repo, "config", "user.email", "tester@example.com")
+                (repo / "main.txt").write_text(subject, encoding="utf-8")
+                git(repo, "add", "main.txt")
+                commit_env = {
+                    "GIT_AUTHOR_DATE": "2026-03-24T10:00:00+08:00",
+                    "GIT_COMMITTER_DATE": "2026-03-24T10:00:00+08:00",
+                }
+                git(repo, "commit", "-m", subject, env=commit_env)
+
+            session_root = base / "sessions"
+            write_session(
+                session_root / "2026" / "03" / "25" / "one.jsonl",
+                str(alpha),
+                "session-a",
+                [
+                    user_message("梳理 Alpha"),
+                    assistant_message("已梳理 Alpha。"),
+                ],
+            )
+
+            settings = {
+                "session_root": str(session_root),
+                "data_root": str(base / "data"),
+                "timezone": "Asia/Shanghai",
+                "records_weeks": 2,
+            }
+            module.sync_sessions(
+                settings=settings,
+                current_cwd="/tmp",
+                now=datetime.fromisoformat("2026-03-25T12:00:00+08:00"),
+            )
+
+            report = module.prepare_weekly_source(
+                week_id="2026-W13",
+                mapping={"path_map": {str(alpha): "Alpha 项目", str(beta): "Beta 项目"}},
+                settings=settings,
+            )
+
+            self.assertEqual(1, len(report["projects"]))
+            self.assertEqual("Alpha 项目", report["projects"][0]["name"])
+            self.assertEqual([], report["unknown_paths"])
+
+    def test_prepare_report_ignores_personal_paths(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "notes"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.name", "Tester")
+            git(repo, "config", "user.email", "tester@example.com")
+            (repo / "main.txt").write_text("feat: 个人记录", encoding="utf-8")
+            git(repo, "add", "main.txt")
+            commit_env = {
+                "GIT_AUTHOR_DATE": "2026-03-24T10:00:00+08:00",
+                "GIT_COMMITTER_DATE": "2026-03-24T10:00:00+08:00",
+            }
+            git(repo, "commit", "-m", "feat: 个人记录", env=commit_env)
+
+            session_root = base / "sessions"
+            write_session(
+                session_root / "2026" / "03" / "25" / "one.jsonl",
+                str(repo),
+                "session-a",
+                [
+                    user_message("记录个人事项"),
+                    assistant_message("已记录个人事项。"),
+                ],
+            )
+
+            settings = {
+                "session_root": str(session_root),
+                "data_root": str(base / "data"),
+                "timezone": "Asia/Shanghai",
+                "records_weeks": 2,
+            }
+            module.sync_sessions(
+                settings=settings,
+                current_cwd="/tmp",
+                now=datetime.fromisoformat("2026-03-25T12:00:00+08:00"),
+            )
+
+            report = module.prepare_weekly_source(
+                week_id="2026-W13",
+                mapping={"path_map": {}, "personal_paths": [str(repo)]},
+                settings=settings,
+            )
+
+            self.assertEqual([], report["projects"])
+            self.assertEqual([], report["unknown_paths"])
+
+    def test_build_workbench_payload_auto_syncs_when_index_missing(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "alpha"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.name", "Tester")
+            git(repo, "config", "user.email", "tester@example.com")
+            (repo / "main.txt").write_text("feat: 完成 Alpha", encoding="utf-8")
+            git(repo, "add", "main.txt")
+            commit_env = {
+                "GIT_AUTHOR_DATE": "2026-03-24T10:00:00+08:00",
+                "GIT_COMMITTER_DATE": "2026-03-24T10:00:00+08:00",
+            }
+            git(repo, "commit", "-m", "feat: 完成 Alpha", env=commit_env)
+            write_session(
+                base / "sessions" / "2026" / "03" / "25" / "one.jsonl",
+                str(repo),
+                "session-a",
+                [
+                    user_message("梳理 Alpha"),
+                    assistant_message("已梳理 Alpha。"),
+                ],
+            )
+
+            settings = {
+                "session_root": str(base / "sessions"),
+                "data_root": str(base / "data"),
+                "timezone": "Asia/Shanghai",
+                "records_weeks": 2,
+            }
+            payload = module.build_workbench_payload(
+                settings=settings,
+                mapping={"path_map": {str(repo): "Alpha 项目"}},
+                week_id="2026-W13",
+            )
+
+            self.assertEqual(1, len(payload["source"]["projects"]))
+            self.assertEqual("Alpha 项目", payload["source"]["projects"][0]["name"])
+
+    def test_build_workbench_payload_shows_unknown_paths_in_copy_friendly_format(self):
+        module = load_module()
+        payload = module.build_workbench_payload(
+            settings={"data_root": "/tmp/xiaozhi-test", "session_root": "/tmp/none", "timezone": "Asia/Shanghai"},
+            mapping={"path_map": {}},
+            week_id="2026-W13",
+            draft="本周工作内容\n",
+        )
+        formatted = module.format_unknown_paths_hint(["/tmp/a", "/tmp/b"])
+        self.assertEqual('/tmp/a - ""\n/tmp/b - ""', formatted)
+        self.assertIn("unknown_paths", payload)
+
+    def test_build_workbench_payload_prefills_git_identity_from_current_repo(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.name", "Tester")
+            git(repo, "config", "user.email", "tester@example.com")
+            cwd = Path.cwd()
+            os.chdir(repo)
+            try:
+                payload = module.build_workbench_payload(
+                    settings={
+                        "data_root": str(repo / ".xiaozhi-worklog"),
+                        "session_root": str(repo / "sessions"),
+                        "timezone": "Asia/Shanghai",
+                    },
+                    mapping={"path_map": {}},
+                    week_id="2026-W13",
+                    draft="本周工作内容\n",
+                )
+            finally:
+                os.chdir(cwd)
+
+            self.assertIn("tester@example.com", payload["git_identity"]["emails"])
+
+    def test_workbench_state_reads_latest_staged_draft_from_disk(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            data_root = base / "data"
+            week_id = "2026-W13"
+            now = datetime.fromisoformat("2026-03-25T12:00:00+08:00")
+
+            module.stage_weekly_report(data_root, week_id, "old draft\n", now)
+            state = module.WorkbenchState(
+                settings={
+                    "data_root": str(data_root),
+                    "session_root": str(base / "sessions"),
+                    "timezone": "Asia/Shanghai",
+                },
+                mapping={"path_map": {}},
+                mapping_path=base / "report-mapping.json",
+                week_id=week_id,
+            )
+
+            module.stage_weekly_report(data_root, week_id, "new draft from cli\n", now)
+
+            self.assertEqual("new draft from cli\n", state.get_payload()["draft"])
+
+    def test_regenerate_workbench_draft_syncs_latest_sessions_before_rendering(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "alpha"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.name", "Tester")
+            git(repo, "config", "user.email", "tester@example.com")
+
+            session_root = base / "sessions"
+            write_session(
+                session_root / "2026" / "03" / "25" / "one.jsonl",
+                str(repo),
+                "session-a",
+                [
+                    user_message("梳理 Alpha"),
+                    assistant_message("已梳理 Alpha。"),
+                ],
+            )
+
+            settings = {
+                "session_root": str(session_root),
+                "data_root": str(base / "data"),
+                "timezone": "Asia/Shanghai",
+                "records_weeks": 2,
+            }
+            state = module.WorkbenchState(
+                settings=settings,
+                mapping={"path_map": {str(repo): "Alpha 项目"}},
+                mapping_path=base / "report-mapping.json",
+                week_id="2026-W13",
+            )
+
+            write_session(
+                session_root / "2026" / "03" / "25" / "two.jsonl",
+                str(repo),
+                "session-b",
+                [
+                    user_message("补充 Beta"),
+                    assistant_message("已补充 Beta。"),
+                ],
+            )
+
+            updated = module.regenerate_workbench_draft(state, note="")
+
+            self.assertEqual(2, updated["source"]["projects"][0]["session_count"])
 
     def test_render_weekly_source_markdown_mentions_git_and_session_sections(self):
         module = load_module()
@@ -828,6 +1431,19 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Session context", rendered)
         self.assertIn("feat: 完成首页", rendered)
 
+    def test_render_weekly_report_draft_prompts_mapping_when_only_unknown_paths_exist(self):
+        module = load_module()
+        draft = module.render_weekly_report_draft(
+            {
+                "week": "2026-W13",
+                "projects": [],
+                "unknown_paths": ["/tmp/alpha"],
+            }
+        )
+
+        self.assertIn("待配置路径", draft)
+        self.assertIn('/tmp/alpha - ""', draft)
+
 
 class MappingTests(unittest.TestCase):
     def test_set_and_delete_mapping_persist_exact_pwd_mapping(self):
@@ -837,13 +1453,67 @@ class MappingTests(unittest.TestCase):
             mapping_path.write_text('{"path_map": {}}', encoding="utf-8")
 
             updated = module.set_mapping(mapping_path, "/a/project", "Alpha")
-            self.assertEqual({"path_map": {"/a/project": "Alpha"}}, updated)
+            self.assertEqual(
+                {"path_map": {"/a/project": "Alpha"}, "personal_paths": []},
+                updated,
+            )
 
             listed = module.load_mapping(mapping_path)
             self.assertEqual("Alpha", listed["path_map"]["/a/project"])
 
             updated = module.delete_mapping(mapping_path, "/a/project")
-            self.assertEqual({"path_map": {}}, updated)
+            self.assertEqual({"path_map": {}, "personal_paths": []}, updated)
+
+    def test_set_and_delete_personal_path_persist(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_path = Path(tmp) / "report-mapping.json"
+            mapping_path.write_text('{"path_map": {}, "personal_paths": []}', encoding="utf-8")
+
+            updated = module.set_personal_path(mapping_path, "/a/personal")
+            self.assertEqual(["/a/personal"], updated["personal_paths"])
+
+            updated = module.delete_personal_path(mapping_path, "/a/personal")
+            self.assertEqual([], updated["personal_paths"])
+
+    def test_set_add_remove_and_load_git_identity_map(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_path = Path(tmp) / "git-identity.json"
+
+            updated = module.set_git_identity(
+                identity_path,
+                emails=["owner@example.com"],
+                names=["Owner Laptop"],
+            )
+            self.assertEqual(
+                {"emails": ["owner@example.com"], "names": ["Owner Laptop"]},
+                updated,
+            )
+
+            updated = module.add_git_identity_alias(
+                identity_path,
+                emails=["owner@company.com"],
+                names=["Owner Desktop"],
+            )
+            self.assertEqual(
+                ["owner@company.com", "owner@example.com"],
+                updated["emails"],
+            )
+            self.assertEqual(
+                ["Owner Desktop", "Owner Laptop"],
+                updated["names"],
+            )
+
+            updated = module.remove_git_identity_alias(
+                identity_path,
+                emails=["owner@example.com"],
+                names=["Owner Laptop"],
+            )
+            self.assertEqual(
+                {"emails": ["owner@company.com"], "names": ["Owner Desktop"]},
+                updated,
+            )
 
 
 class DraftArchiveTests(unittest.TestCase):

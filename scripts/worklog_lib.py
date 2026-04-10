@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import subprocess
 from collections import defaultdict
@@ -26,16 +27,32 @@ def save_json(path, payload):
         json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+def resolve_config_relative_path(raw_path, base_dir):
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    if base_dir.name == "config" and candidate.parts[:1] == (".xiaozhi",):
+        return (base_dir.parent.parent / candidate).resolve()
+    return (base_dir / candidate).resolve()
+
+
 def resolve_settings(settings, settings_path=None):
     if settings_path is None:
         base_dir = Path.cwd()
     else:
         base_dir = Path(settings_path).resolve().parent
-    data_root = Path(settings.get("data_root", "./data"))
-    if not data_root.is_absolute():
-        data_root = (base_dir / data_root).resolve()
+    default_runtime_root = base_dir.parent / "runtime" if base_dir.name == "config" else base_dir / ".xiaozhi" / "runtime"
+    data_root = resolve_config_relative_path(settings.get("data_root", default_runtime_root), base_dir)
+    default_identity_path = (
+        base_dir / "git-identity.json" if base_dir.name == "config" else base_dir / ".xiaozhi" / "config" / "git-identity.json"
+    )
+    git_identity_path = resolve_config_relative_path(
+        settings.get("git_identity_path", default_identity_path),
+        base_dir,
+    )
     resolved = dict(settings)
     resolved["data_root"] = str(data_root)
+    resolved["git_identity_path"] = str(git_identity_path)
     resolved["timezone"] = settings.get("timezone", "Asia/Shanghai")
     resolved["records_weeks"] = int(settings.get("records_weeks", 2))
     resolved["monitored_roots"] = list(settings.get("monitored_roots", []))
@@ -54,7 +71,7 @@ def resolve_session_providers(settings, base_dir):
     configured = settings.get("session_providers", [])
     if configured:
         for item in configured:
-            root = Path(item["root"])
+            root = Path(item["root"]).expanduser()
             if not root.is_absolute():
                 root = (base_dir / root).resolve()
             providers.append(
@@ -66,8 +83,8 @@ def resolve_session_providers(settings, base_dir):
             )
         return providers
 
-    legacy_root = settings.get("session_root", "/Users/lh/.codex/sessions")
-    root = Path(legacy_root)
+    legacy_root = settings.get("session_root", "~/.codex/sessions")
+    root = Path(legacy_root).expanduser()
     if not root.is_absolute():
         root = (base_dir / root).resolve()
     return [{"name": "codex", "type": "codex", "root": str(root)}]
@@ -105,6 +122,31 @@ def week_bounds_for_id(week_id, timezone_name):
     )
     end = start + timedelta(days=7)
     return start, end
+
+
+def month_week_start(year, month, week_number, timezone_name):
+    tz = ZoneInfo(timezone_name)
+    cursor = datetime(year, month, 1, tzinfo=tz, hour=0, minute=0, second=0, microsecond=0)
+    while cursor.weekday() != 0:
+        cursor += timedelta(days=1)
+    return cursor + timedelta(weeks=week_number - 1)
+
+
+def resolve_week_spec(week_spec, now, timezone_name):
+    if not week_spec or week_spec == "本周":
+        return week_id_for(now, timezone_name)
+    if week_spec == "上周":
+        return week_id_for(now - timedelta(weeks=1), timezone_name)
+    if re.fullmatch(r"\d{4}-W\d{2}", week_spec):
+        return week_spec
+    match = re.fullmatch(r"(?:(\d{4})-)?(\d{2})-w([1-5])", week_spec, flags=re.IGNORECASE)
+    if match:
+        year = int(match.group(1) or now.astimezone(ZoneInfo(timezone_name)).year)
+        month = int(match.group(2))
+        week_number = int(match.group(3))
+        start = month_week_start(year, month, week_number, timezone_name)
+        return week_id_for(start, timezone_name)
+    raise ValueError(f"Unsupported week spec: {week_spec}")
 
 
 def iter_candidate_session_files(session_root, now, keep_weeks, timezone_name):
@@ -405,16 +447,6 @@ def save_project_index(data_root, week_id, payload):
     save_json(Path(data_root) / "index" / week_id / "projects.json", payload)
 
 
-def add_session_touch(data_root, week_id, cwd, session_id):
-    index = load_project_index(data_root, week_id)
-    sessions = normalize_index_refs(index.setdefault("projects", {}).setdefault(cwd, []))
-    ref = session_id if isinstance(session_id, dict) else {"provider": "codex", "session_id": session_id}
-    if ref not in sessions:
-        sessions.append(ref)
-    index["projects"][cwd] = sorted(sessions, key=lambda item: (item["provider"], item["session_id"]))
-    save_project_index(data_root, week_id, index)
-
-
 def normalize_index_refs(refs):
     normalized = []
     for ref in refs:
@@ -423,6 +455,68 @@ def normalize_index_refs(refs):
         elif isinstance(ref, str):
             normalized.append({"provider": "codex", "session_id": ref})
     return normalized
+
+
+def normalize_session_state_entry(provider_name, metadata):
+    normalized = {
+        "provider": provider_name,
+        "mtime_ns": metadata.get("mtime_ns"),
+        "size": metadata.get("size"),
+        "cwd": metadata.get("cwd"),
+        "session_id": metadata.get("session_id"),
+        "timestamp": metadata.get("timestamp"),
+    }
+    timestamp = normalized.get("timestamp")
+    if timestamp:
+        try:
+            normalized["week_id"] = week_id_for(
+                datetime.fromisoformat(timestamp.replace("Z", "+00:00")),
+                "Asia/Shanghai",
+            )
+        except ValueError:
+            normalized["week_id"] = None
+    else:
+        normalized["week_id"] = None
+    return normalized
+
+
+def rebuild_weekly_indexes(data_root, sessions_state, keep_weeks, now, timezone_name):
+    root = Path(data_root) / "index"
+    root.mkdir(parents=True, exist_ok=True)
+    keep_weeks_ids = []
+    current = week_start_for(now, timezone_name)
+    for offset in range(max(keep_weeks, 0)):
+        keep_weeks_ids.append(week_id_for(current - timedelta(weeks=offset), timezone_name))
+
+    project_refs_by_week = {week_id: defaultdict(list) for week_id in keep_weeks_ids}
+    for metadata in sessions_state.values():
+        timestamp = metadata.get("timestamp")
+        cwd = metadata.get("cwd")
+        session_id = metadata.get("session_id")
+        provider = metadata.get("provider")
+        if not (timestamp and cwd and session_id and provider):
+            continue
+        try:
+            week_id = week_id_for(
+                datetime.fromisoformat(timestamp.replace("Z", "+00:00")),
+                timezone_name,
+            )
+        except ValueError:
+            continue
+        if week_id not in project_refs_by_week:
+            continue
+        ref = {"provider": provider, "session_id": session_id}
+        refs = project_refs_by_week[week_id][cwd]
+        if ref not in refs:
+            refs.append(ref)
+
+    for week_id in keep_weeks_ids:
+        payload = {"week": week_id, "projects": {}}
+        for cwd, refs in sorted(project_refs_by_week[week_id].items()):
+            payload["projects"][cwd] = sorted(
+                refs, key=lambda item: (item["provider"], item["session_id"])
+            )
+        save_project_index(data_root, week_id, payload)
 
 
 def prune_weekly_index(data_root, keep_weeks, now, timezone_name):
@@ -445,9 +539,14 @@ def prune_weekly_index(data_root, keep_weeks, now, timezone_name):
 
 
 def load_mapping(path):
-    data = load_json(path, {"path_map": {}})
+    data = load_json(path, {"path_map": {}, "personal_paths": []})
     if "path_map" in data and isinstance(data["path_map"], dict):
-        return {"path_map": dict(data["path_map"])}
+        return {
+            "path_map": dict(data["path_map"]),
+            "personal_paths": sorted(
+                {item for item in data.get("personal_paths", []) if isinstance(item, str) and item}
+            ),
+        }
 
     path_map = {}
     for project in data.get("projects", []):
@@ -455,11 +554,16 @@ def load_mapping(path):
         for item in project.get("paths", []):
             if isinstance(item, str) and isinstance(name, str):
                 path_map[item] = name
-    return {"path_map": path_map}
+    return {"path_map": path_map, "personal_paths": []}
 
 
 def save_mapping(path, mapping):
-    normalized = {"path_map": dict(mapping.get("path_map", {}))}
+    normalized = {
+        "path_map": dict(mapping.get("path_map", {})),
+        "personal_paths": sorted(
+            {item for item in mapping.get("personal_paths", []) if isinstance(item, str) and item}
+        ),
+    }
     save_json(path, normalized)
     return normalized
 
@@ -476,12 +580,84 @@ def delete_mapping(path, pwd):
     return save_mapping(path, mapping)
 
 
+def set_personal_path(path, pwd):
+    mapping = load_mapping(path)
+    personal_paths = set(mapping.get("personal_paths", []))
+    personal_paths.add(pwd)
+    mapping["personal_paths"] = sorted(personal_paths)
+    mapping.setdefault("path_map", {}).pop(pwd, None)
+    return save_mapping(path, mapping)
+
+
+def delete_personal_path(path, pwd):
+    mapping = load_mapping(path)
+    personal_paths = set(mapping.get("personal_paths", []))
+    personal_paths.discard(pwd)
+    mapping["personal_paths"] = sorted(personal_paths)
+    return save_mapping(path, mapping)
+
+
+def load_git_identity_map(path):
+    if not path:
+        return {"emails": [], "names": []}
+    data = load_json(path, {"emails": [], "names": []})
+    return {
+        "emails": sorted({item for item in data.get("emails", []) if isinstance(item, str) and item}),
+        "names": sorted({item for item in data.get("names", []) if isinstance(item, str) and item}),
+    }
+
+
+def save_git_identity_map(path, identity):
+    normalized = {
+        "emails": sorted({item for item in identity.get("emails", []) if item}),
+        "names": sorted({item for item in identity.get("names", []) if item}),
+    }
+    save_json(path, normalized)
+    return normalized
+
+
+def set_git_identity(path, emails=None, names=None):
+    return save_git_identity_map(
+        path,
+        {
+            "emails": list(emails or []),
+            "names": list(names or []),
+        },
+    )
+
+
+def add_git_identity_alias(path, emails=None, names=None):
+    current = load_git_identity_map(path)
+    return save_git_identity_map(
+        path,
+        {
+            "emails": current["emails"] + list(emails or []),
+            "names": current["names"] + list(names or []),
+        },
+    )
+
+
+def remove_git_identity_alias(path, emails=None, names=None):
+    current = load_git_identity_map(path)
+    remove_emails = set(emails or [])
+    remove_names = set(names or [])
+    return save_git_identity_map(
+        path,
+        {
+            "emails": [item for item in current["emails"] if item not in remove_emails],
+            "names": [item for item in current["names"] if item not in remove_names],
+        },
+    )
+
+
 def sync_sessions(settings, current_cwd, now):
     del current_cwd
     resolved = resolve_settings(settings)
     state = load_state(resolved["data_root"])
     sessions_state = state.setdefault("sessions", {})
     touched = set()
+    active_file_keys = set()
+    active_provider_names = {provider["name"] for provider in resolved["session_providers"]}
 
     for provider in resolved["session_providers"]:
         for session_path in iter_provider_candidate_session_files(
@@ -492,6 +668,7 @@ def sync_sessions(settings, current_cwd, now):
         ):
             session_path = Path(session_path)
             file_key = f"{provider['name']}::{session_path.resolve()}"
+            active_file_keys.add(file_key)
             file_stat = session_path.stat()
             previous = sessions_state.get(file_key, {})
             if (
@@ -509,12 +686,6 @@ def sync_sessions(settings, current_cwd, now):
                     datetime.fromisoformat(timestamp.replace("Z", "+00:00")),
                     resolved["timezone"],
                 )
-                add_session_touch(
-                    resolved["data_root"],
-                    week_id,
-                    cwd,
-                    {"provider": provider["name"], "session_id": session_id},
-                )
                 touched.add((week_id, cwd, provider["name"], session_id))
 
             sessions_state[file_key] = {
@@ -523,8 +694,21 @@ def sync_sessions(settings, current_cwd, now):
                 "size": file_stat.st_size,
                 "cwd": cwd,
                 "session_id": session_id,
+                "timestamp": timestamp,
             }
 
+    for file_key in list(sessions_state):
+        provider_name, _, _ = file_key.partition("::")
+        if provider_name in active_provider_names and file_key not in active_file_keys:
+            sessions_state.pop(file_key, None)
+
+    rebuild_weekly_indexes(
+        resolved["data_root"],
+        sessions_state,
+        resolved["records_weeks"],
+        now,
+        resolved["timezone"],
+    )
     save_state(resolved["data_root"], state)
     prune_weekly_index(
         resolved["data_root"],
@@ -554,15 +738,18 @@ def run_git(repo_path, args):
 
 def detect_git_identity(repo_path, settings):
     configured = settings.get("git_identity", {})
-    emails = list(configured.get("emails", []))
-    names = list(configured.get("names", []))
-
-    repo_email = run_git(repo_path, ["config", "--get", "user.email"])
-    repo_name = run_git(repo_path, ["config", "--get", "user.name"])
-    if repo_email:
-        emails.append(repo_email.strip())
-    if repo_name:
-        names.append(repo_name.strip())
+    file_identity = load_git_identity_map(settings.get("git_identity_path", ""))
+    defaults = discover_git_identity_defaults(repo_path)
+    emails = (
+        list(file_identity.get("emails", []))
+        + list(configured.get("emails", []))
+        + list(defaults.get("emails", []))
+    )
+    names = (
+        list(file_identity.get("names", []))
+        + list(configured.get("names", []))
+        + list(defaults.get("names", []))
+    )
 
     return {
         "emails": sorted({item for item in emails if item}),
@@ -570,14 +757,41 @@ def detect_git_identity(repo_path, settings):
     }
 
 
+def run_git_config(scope_args, key, cwd=None):
+    try:
+        completed = subprocess.run(
+            ["git", "config", *scope_args, "--get", key],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def discover_git_identity_defaults(repo_path=None):
+    local_email = run_git_config([], "user.email", cwd=repo_path)
+    local_name = run_git_config([], "user.name", cwd=repo_path)
+    global_email = run_git_config(["--global"], "user.email")
+    global_name = run_git_config(["--global"], "user.name")
+    emails = sorted({item for item in (local_email, global_email) if item})
+    names = sorted({item for item in (local_name, global_name) if item})
+    return {"emails": emails, "names": names}
+
+
 def is_personal_commit(commit, identity):
     author_email = commit.get("author_email", "")
     author_name = commit.get("author_name", "")
     if identity["emails"] and author_email in identity["emails"]:
         return True
-    if identity["names"] and author_name in identity["names"]:
+    if not identity["emails"] and identity["names"] and author_name in identity["names"]:
         return True
-    return not identity["emails"] and not identity["names"]
+    return False
 
 
 def collect_git_commits(repo_path, week_id, timezone_name, settings):
@@ -691,9 +905,47 @@ def extract_session_items_for_refs(providers, week_id, timezone_name, session_re
     return items
 
 
+def collect_weekly_project_index_from_sessions(settings, week_id):
+    resolved = resolve_settings(settings)
+    projects = defaultdict(list)
+    for provider in resolved["session_providers"]:
+        for session_path in iter_provider_lookup_session_files(
+            provider, week_id, resolved["timezone"]
+        ):
+            meta = parse_session_meta_for_provider(provider["type"], session_path)
+            timestamp = meta.get("timestamp")
+            cwd = meta.get("cwd")
+            session_id = meta.get("session_id")
+            if not (timestamp and cwd and session_id):
+                continue
+            try:
+                record_week = week_id_for(
+                    datetime.fromisoformat(timestamp.replace("Z", "+00:00")),
+                    resolved["timezone"],
+                )
+            except ValueError:
+                continue
+            if record_week != week_id:
+                continue
+            ref = {"provider": provider["name"], "session_id": session_id}
+            if ref not in projects[cwd]:
+                projects[cwd].append(ref)
+    payload = {"week": week_id, "projects": {}}
+    for cwd in sorted(projects):
+        payload["projects"][cwd] = sorted(
+            projects[cwd], key=lambda item: (item["provider"], item["session_id"])
+        )
+    return payload
+
+
 def load_mapping_from_object(mapping):
     if "path_map" in mapping and isinstance(mapping["path_map"], dict):
-        return {"path_map": dict(mapping["path_map"])}
+        return {
+            "path_map": dict(mapping["path_map"]),
+            "personal_paths": sorted(
+                {item for item in mapping.get("personal_paths", []) if isinstance(item, str) and item}
+            ),
+        }
     return load_mapping_object_legacy(mapping)
 
 
@@ -704,7 +956,7 @@ def load_mapping_object_legacy(mapping):
         for item in project.get("paths", []):
             if isinstance(item, str) and isinstance(name, str):
                 path_map[item] = name
-    return {"path_map": path_map}
+    return {"path_map": path_map, "personal_paths": []}
 
 
 def merge_project_rows(project_rows):
@@ -752,9 +1004,21 @@ def prepare_weekly_source(week_id, mapping, settings):
     resolved = resolve_settings(settings)
     normalized_mapping = load_mapping_from_object(mapping)
     weekly_index = load_project_index(resolved["data_root"], week_id)
+    if not weekly_index.get("projects"):
+        weekly_index = collect_weekly_project_index_from_sessions(resolved, week_id)
+        save_project_index(resolved["data_root"], week_id, weekly_index)
+    personal_paths = set(normalized_mapping.get("personal_paths", []))
+    unknown_paths = []
 
     by_project = defaultdict(list)
-    for cwd, project_name in normalized_mapping["path_map"].items():
+    touched_paths = weekly_index.get("projects", {})
+    for cwd in sorted(touched_paths):
+        if cwd in personal_paths:
+            continue
+        project_name = normalized_mapping["path_map"].get(cwd)
+        if not project_name:
+            unknown_paths.append(cwd)
+            continue
         repo_path = Path(cwd)
         git_payload = {
             "commits": collect_git_commits(repo_path, week_id, resolved["timezone"], resolved),
@@ -764,7 +1028,7 @@ def prepare_weekly_source(week_id, mapping, settings):
             resolved["session_providers"],
             week_id,
             resolved["timezone"],
-            weekly_index.get("projects", {}).get(cwd, []),
+            touched_paths.get(cwd, []),
         )
         by_project[project_name].append(
             {
@@ -785,7 +1049,7 @@ def prepare_weekly_source(week_id, mapping, settings):
                 "sessions": merged["sessions"],
             }
         )
-    return {"week": week_id, "projects": projects}
+    return {"week": week_id, "projects": projects, "unknown_paths": unknown_paths}
 
 
 def render_weekly_source_markdown(source):
@@ -909,21 +1173,19 @@ def collect_project_topics(project):
         seen.add(normalized)
         topics.append({"text": text, "source": "session"})
 
-    for path in project["git"]["working_tree"]["modified"]:
-        text = f"补充完善 {summarize_path_label(path)} 相关改动"
+    if project["git"]["working_tree"]["modified"]:
+        text = "完善配套改动与联调验证"
         normalized = normalize_summary_text(text)
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        topics.append({"text": text, "source": "working_tree"})
+        if normalized not in seen:
+            seen.add(normalized)
+            topics.append({"text": text, "source": "working_tree"})
 
-    for path in project["git"]["working_tree"]["untracked"]:
-        text = f"整理补充 {summarize_path_label(path)} 相关材料"
+    if project["git"]["working_tree"]["untracked"]:
+        text = "补充交付说明与相关材料"
         normalized = normalize_summary_text(text)
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        topics.append({"text": text, "source": "working_tree"})
+        if normalized not in seen:
+            seen.add(normalized)
+            topics.append({"text": text, "source": "working_tree"})
 
     return topics
 
@@ -950,6 +1212,17 @@ def summarize_topic_text(text):
     return localize_phrase(stripped)
 
 
+def normalize_management_module(text):
+    stripped = summarize_topic_text(text)
+    stripped = re.sub(r"\b[a-z0-9_-]+\.(js|jsx|ts|tsx|md|json|py|java|vue)\b", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\b[a-z0-9_/-]{3,}\b", "", stripped, flags=re.IGNORECASE)
+    for prefix in ("完成", "优化", "推进", "完善", "修复", "补充", "整理", "支持", "支撑"):
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].strip()
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ，、。")
+    return stripped or "重点事项"
+
+
 def group_topics(topics):
     grouped = []
     for topic in topics:
@@ -969,12 +1242,43 @@ def group_topics(topics):
     return grouped
 
 
-def render_topic_bullet(group):
+def compress_topic_groups(groups, max_groups=7):
+    if len(groups) <= max_groups:
+        return groups
+    head = groups[: max_groups - 1]
+    tail_items = []
+    for group in groups[max_groups - 1 :]:
+        tail_items.extend(group["items"])
+    head.append({"key": "配套支撑", "summary": "配套支撑", "items": tail_items})
+    return head
+
+
+def choose_group_action(group, guidance=""):
+    combined = " ".join(summarize_topic_text(item["text"]) for item in group["items"])
+    guidance_text = (guidance or "").strip()
+    if group["key"] == "方案与说明":
+        return "推进" if ("进度" in guidance_text or "推进" in guidance_text) else "完善"
+    if group["key"] == "验证与质量":
+        return "完善"
+    if any(word in combined for word in ("优化", "修复", "筛选", "体验", "调整")):
+        return "优化"
+    if any(word in combined for word in ("方案", "说明", "调研", "预案", "规划")):
+        return "推进"
+    if any(word in combined for word in ("验证", "测试", "联调", "质量")):
+        return "完善"
+    return "完成"
+
+
+def render_topic_bullet(group, guidance=""):
     texts = [summarize_topic_text(item["text"]) for item in group["items"]]
     combined = "、".join(dict.fromkeys(texts))
     key = group["key"]
+    guidance_text = (guidance or "").strip()
+    wants_testing = "测试" in guidance_text or "验证" in guidance_text
+    wants_progress = "进度" in guidance_text or "推进" in guidance_text
     if key == "维保计划周期配置":
-        return f"完善维保计划周期配置，补齐 mock 数据分布并完成相关测试验证。"
+        suffix = "并完成相关测试验证" if wants_testing or "测试" in combined else "并补齐相关业务支撑"
+        return f"完善维保计划周期配置，补齐 mock 数据分布{suffix}。"
     if key == "打印与输出":
         detail = "打印模板" if "打印模板" in combined else "打印与输出"
         return f"完善{detail}相关能力，补充配套说明并支撑业务使用。"
@@ -982,27 +1286,48 @@ def render_topic_bullet(group):
         detail = "列车看板筛选" if "列车看板筛选" in combined else "筛选与列表交互"
         return f"完成{detail}相关优化，提升页面使用体验。"
     if key == "方案与说明":
-        return f"完善方案与说明材料，为后续功能推进提供支持。"
+        action = "推进" if wants_progress else "完善"
+        return f"{action}方案与说明材料，为后续功能推进提供支持。"
     if key == "验证与质量":
         return f"完善相关验证工作，保障改动质量与可用性。"
-    if "并" in combined:
-        return f"{combined}。"
-    return f"围绕{key}完成相关优化，支撑项目整体推进。"
+    if key == "配套支撑":
+        return "完善配套支撑事项，保障阶段交付顺畅推进。"
+    module = normalize_management_module(group.get("summary") or key)
+    action = choose_group_action(group, guidance=guidance)
+    if action == "优化":
+        return f"优化{module}相关能力，提升场景支撑与使用体验。"
+    if action == "推进":
+        return f"推进{module}相关事项，补齐方案与协同支撑。"
+    if action == "完善":
+        return f"完善{module}相关工作，保障阶段成果稳定落地。"
+    return f"完成{module}相关工作，补齐配套支撑并推动阶段成果落地。"
 
 
-def render_weekly_report_draft(source):
+def render_weekly_report_draft(source, guidance=""):
     lines = ["本周工作内容"]
     if not source["projects"]:
+        unknown_paths = source.get("unknown_paths", [])
+        if unknown_paths:
+            lines.extend(
+                [
+                    "",
+                    "发现待配置路径，请先补充项目映射或标记为个人目录：",
+                    format_unknown_paths_hint(unknown_paths),
+                    "",
+                    "配置完成后再重新生成周报。",
+                ]
+            )
+            return "\n".join(lines) + "\n"
         return "本周工作内容\n\n暂无可汇总内容。\n"
 
     for project in source["projects"]:
         lines.append("")
         lines.append(f"{project['name']} {estimate_project_effort(project)}d")
-        groups = group_topics(collect_project_topics(project))
+        groups = compress_topic_groups(group_topics(collect_project_topics(project)))
         if not groups:
             groups = [{"key": "本周工作内容", "summary": "本周工作内容", "items": []}]
         for index, group in enumerate(groups, start=1):
-            lines.append(f"{index}. {render_topic_bullet(group)}")
+            lines.append(f"{index}. {render_topic_bullet(group, guidance=guidance)}")
     return "\n".join(lines) + "\n"
 
 
@@ -1015,14 +1340,25 @@ def load_staged_report(data_root, week_id):
 
 def summarize_index_status(data_root, week_id, mapping):
     normalized_mapping = load_mapping_from_object(mapping)
+    personal_paths = set(normalized_mapping.get("personal_paths", []))
     index = load_project_index(data_root, week_id)
     projects = []
     for cwd in sorted(index.get("projects", {})):
         refs = normalize_index_refs(index["projects"][cwd])
+        if cwd in personal_paths:
+            category = "personal"
+            project_name = "个人目录"
+        elif cwd in normalized_mapping["path_map"]:
+            category = "project"
+            project_name = normalized_mapping["path_map"][cwd]
+        else:
+            category = "unknown"
+            project_name = Path(cwd).name or cwd
         projects.append(
             {
                 "cwd": cwd,
-                "project_name": normalized_mapping["path_map"].get(cwd, Path(cwd).name or cwd),
+                "project_name": project_name,
+                "category": category,
                 "session_count": len(refs),
                 "providers": sorted({ref["provider"] for ref in refs}),
             }
@@ -1062,17 +1398,35 @@ def summarize_source_for_workbench(source):
     return {"week": source["week"], "projects": projects}
 
 
-def build_workbench_payload(settings, mapping, week_id, draft=None):
-    source = prepare_weekly_source(week_id=week_id, mapping=mapping, settings=settings)
-    staged = load_staged_report(settings["data_root"], week_id)
+def build_workbench_payload(settings, mapping, week_id, draft=None, regenerate_note=""):
+    resolved = resolve_settings(settings)
+    existing_index = load_project_index(resolved["data_root"], week_id)
+    if not existing_index.get("projects"):
+        _, week_end = week_bounds_for_id(week_id, resolved["timezone"])
+        sync_sessions(
+            settings=resolved,
+            current_cwd=str(Path.cwd()),
+            now=week_end - timedelta(seconds=1),
+        )
+    source = prepare_weekly_source(week_id=week_id, mapping=mapping, settings=resolved)
+    staged = load_staged_report(resolved["data_root"], week_id)
     content = draft if draft is not None else (staged or render_weekly_report_draft(source))
     return {
         "week": week_id,
         "draft": content,
-        "skill": build_skill_info(settings),
-        "index_status": summarize_index_status(settings["data_root"], week_id, mapping),
+        "regenerate_note": regenerate_note,
+        "skill": build_skill_info(resolved),
+        "index_status": summarize_index_status(resolved["data_root"], week_id, mapping),
         "source": summarize_source_for_workbench(source),
+        "mapping": load_mapping_from_object(mapping),
+        "git_identity": detect_git_identity(Path.cwd(), resolved),
+        "unknown_paths": source.get("unknown_paths", []),
+        "unknown_paths_hint": format_unknown_paths_hint(source.get("unknown_paths", [])),
     }
+
+
+def format_unknown_paths_hint(unknown_paths):
+    return "\n".join(f'{path} - ""' for path in unknown_paths)
 
 
 def render_workbench_html(payload):
@@ -1083,16 +1437,25 @@ def render_workbench_html(payload):
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>小志工作台</title>
   <style>
-    :root {{ --bg:#f5f1e8; --panel:#fffaf0; --ink:#1f2a1f; --accent:#1d6b57; --line:#d8cfbf; }}
+    :root {{ --bg:#f5f1e8; --panel:#fffaf0; --ink:#1f2a1f; --accent:#1d6b57; --line:#d8cfbf; --muted:#6f7569; }}
     body {{ margin:0; font-family: "SF Mono","JetBrains Mono",monospace; color:var(--ink); background:linear-gradient(135deg,#f5f1e8,#efe7d5); }}
     main {{ padding:20px; }}
     section {{ background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:0 12px 30px rgba(0,0,0,.05); }}
     textarea {{ width:100%; min-height:70vh; border:1px solid var(--line); border-radius:12px; padding:12px; font:inherit; background:#fffdf7; box-sizing:border-box; }}
+    .compact {{ min-height:240px; }}
+    input {{ width:100%; border:1px solid var(--line); border-radius:12px; padding:12px; font:inherit; background:#fffdf7; box-sizing:border-box; }}
     .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 0; }}
     button {{ border:0; border-radius:999px; padding:10px 14px; font:inherit; background:var(--accent); color:#fff; cursor:pointer; }}
     button.secondary {{ background:#d9d0bf; color:var(--ink); }}
     .meta {{ font-size:12px; opacity:.8; margin-bottom:8px; }}
+    .helper {{ color:var(--muted); font-size:12px; margin-top:8px; white-space:pre-wrap; }}
+    .status {{ min-height:20px; font-size:12px; color:var(--muted); white-space:pre-wrap; }}
+    .status.error {{ color:#b42318; }}
+    .stack {{ display:flex; flex-direction:column; gap:16px; }}
+    .hidden {{ display:none; }}
+    .label {{ font-size:12px; margin:0 0 8px; color:var(--muted); }}
     h1 {{ margin:0 0 10px; }}
+    button[disabled] {{ opacity:.6; cursor:wait; }}
   </style>
 </head>
 <body>
@@ -1100,12 +1463,41 @@ def render_workbench_html(payload):
     <section>
       <h1>小志工作台</h1>
       <div class="meta" id="meta"></div>
-      <textarea id="draft"></textarea>
       <div class="actions">
-        <button id="saveBtn" class="secondary">保存草稿</button>
-        <button id="regenBtn" class="secondary">重新生成</button>
-        <button id="copyBtn">复制</button>
-        <button id="archiveBtn">确认归档</button>
+        <button id="reportViewBtn" class="secondary">周报</button>
+        <button id="adminViewBtn" class="secondary">后台管理</button>
+      </div>
+      <div id="reportView" class="stack">
+        <div>
+          <div class="label">重新生成补充说明</div>
+          <input id="regenNote" placeholder="例如：突出测试结果、压缩调研表述、偏管理视角" />
+          <div class="helper">这段说明会在重新生成时作为补充提示一起提交。</div>
+        </div>
+        <div id="status" class="status"></div>
+        <textarea id="draft"></textarea>
+        <div class="actions">
+          <button id="saveBtn" class="secondary">保存草稿</button>
+          <button id="regenBtn" class="secondary">重新生成</button>
+          <button id="copyBtn">复制</button>
+          <button id="archiveBtn">确认归档</button>
+        </div>
+      </div>
+      <div id="adminView" class="stack hidden">
+        <div>
+          <div class="label">项目映射 JSON</div>
+          <div class="helper" id="unknownPaths"></div>
+          <textarea id="mappingEditor" class="compact"></textarea>
+          <div class="actions">
+            <button id="saveMappingBtn" class="secondary">保存项目映射</button>
+          </div>
+        </div>
+        <div>
+          <div class="label">Git 用户 JSON</div>
+          <textarea id="identityEditor" class="compact"></textarea>
+          <div class="actions">
+            <button id="saveIdentityBtn" class="secondary">保存 Git 用户</button>
+          </div>
+        </div>
       </div>
     </section>
   </main>
@@ -1113,29 +1505,97 @@ def render_workbench_html(payload):
     const initial = JSON.parse({json.dumps(json.dumps(payload, ensure_ascii=False))});
     const draftEl = document.getElementById('draft');
     const metaEl = document.getElementById('meta');
+    const regenNoteEl = document.getElementById('regenNote');
+    const mappingEditorEl = document.getElementById('mappingEditor');
+    const identityEditorEl = document.getElementById('identityEditor');
+    const unknownPathsEl = document.getElementById('unknownPaths');
+    const reportViewEl = document.getElementById('reportView');
+    const adminViewEl = document.getElementById('adminView');
+    const statusEl = document.getElementById('status');
+    const actionButtons = [
+      document.getElementById('saveBtn'),
+      document.getElementById('regenBtn'),
+      document.getElementById('copyBtn'),
+      document.getElementById('archiveBtn'),
+      document.getElementById('saveMappingBtn'),
+      document.getElementById('saveIdentityBtn'),
+    ];
 
     function render(state) {{
       draftEl.value = state.draft || '';
+      regenNoteEl.value = state.regenerate_note || '';
+      mappingEditorEl.value = JSON.stringify(state.mapping || {{ path_map: {{}} }}, null, 2);
+      identityEditorEl.value = JSON.stringify(state.git_identity || {{ emails: [], names: [] }}, null, 2);
       metaEl.textContent = `周次: ${{state.week}}`;
+      const unknownHint = state.unknown_paths_hint || '';
+      unknownPathsEl.textContent = unknownHint
+        ? `待配置路径:\n${{unknownHint}}`
+        : '当前没有待配置的新路径。';
+    }}
+
+    function showView(view) {{
+      reportViewEl.classList.toggle('hidden', view !== 'report');
+      adminViewEl.classList.toggle('hidden', view !== 'admin');
+    }}
+
+    function setStatus(message, isError = false) {{
+      statusEl.textContent = message || '';
+      statusEl.classList.toggle('error', Boolean(isError));
+    }}
+
+    function setBusy(isBusy, message = '请求进行中...') {{
+      for (const button of actionButtons) {{
+        button.disabled = Boolean(isBusy);
+      }}
+      if (isBusy) {{
+        setStatus(message, false);
+      }} else if (statusEl.textContent === message) {{
+        setStatus('', false);
+      }}
     }}
 
     async function postJson(url, payload) {{
-      const response = await fetch(url, {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify(payload || {{}})
-      }});
-      return response.json();
+      try {{
+        setBusy(true);
+        const response = await fetch(url, {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload || {{}})
+        }});
+        let body = null;
+        try {{
+          body = await response.json();
+        }} catch (_error) {{
+          body = null;
+        }}
+        if (!response.ok) {{
+          const message = body && body.error ? body.error : `请求失败（${{response.status}}）`;
+          setStatus(message, true);
+          throw new Error(message);
+        }}
+        setStatus('');
+        return body;
+      }} catch (error) {{
+        const message = error && error.message ? error.message : '请求失败';
+        setStatus(message, true);
+        throw error;
+      }} finally {{
+        setBusy(false);
+      }}
     }}
 
     document.getElementById('saveBtn').onclick = async () => {{
-      const state = await postJson('/api/draft', {{ draft: draftEl.value }});
-      render(state);
+      try {{
+        const state = await postJson('/api/draft', {{ draft: draftEl.value }});
+        render(state);
+      }} catch (_error) {{}}
     }};
 
     document.getElementById('regenBtn').onclick = async () => {{
-      const state = await postJson('/api/regenerate', {{}});
-      render(state);
+      try {{
+        const state = await postJson('/api/regenerate', {{ note: regenNoteEl.value }});
+        render(state);
+      }} catch (_error) {{}}
     }};
 
     document.getElementById('copyBtn').onclick = async () => {{
@@ -1143,13 +1603,37 @@ def render_workbench_html(payload):
     }};
 
     document.getElementById('archiveBtn').onclick = async () => {{
-      const state = await postJson('/api/archive', {{ draft: draftEl.value }});
-      render(state);
+      try {{
+        const state = await postJson('/api/archive', {{ draft: draftEl.value }});
+        render(state);
+      }} catch (_error) {{}}
     }};
+
+    document.getElementById('saveMappingBtn').onclick = async () => {{
+      try {{
+        const state = await postJson('/api/mapping', {{ mapping: JSON.parse(mappingEditorEl.value || '{{}}') }});
+        render(state);
+      }} catch (error) {{
+        setStatus(error.message || '保存项目映射失败', true);
+      }}
+    }};
+
+    document.getElementById('saveIdentityBtn').onclick = async () => {{
+      try {{
+        const state = await postJson('/api/git-identity', {{ git_identity: JSON.parse(identityEditorEl.value || '{{}}') }});
+        render(state);
+      }} catch (error) {{
+        setStatus(error.message || '保存 Git 用户失败', true);
+      }}
+    }};
+
+    document.getElementById('reportViewBtn').onclick = () => showView('report');
+    document.getElementById('adminViewBtn').onclick = () => showView('admin');
 
     const stream = new EventSource('/events');
     stream.onmessage = (event) => render(JSON.parse(event.data));
     render(initial);
+    showView('report');
   </script>
 </body>
 </html>
@@ -1157,18 +1641,41 @@ def render_workbench_html(payload):
 
 
 class WorkbenchState:
-    def __init__(self, settings, mapping, week_id):
+    def __init__(self, settings, mapping, mapping_path, week_id):
         self.settings = settings
         self.mapping = mapping
+        self.mapping_path = str(mapping_path)
         self.week_id = week_id
+        self.regenerate_note = ""
         self.listeners = []
         self.lock = threading.Lock()
-        self.payload = build_workbench_payload(settings, mapping, week_id)
+        self.payload = build_workbench_payload(settings, mapping, week_id, regenerate_note="")
         self.payload["should_close"] = False
 
-    def get_payload(self):
+    def _preserve_runtime_fields(self, payload):
         with self.lock:
+            current = dict(self.payload)
+        if current.get("should_close"):
+            payload["should_close"] = True
+        if "archived_path" in current:
+            payload["archived_path"] = current["archived_path"]
+        return payload
+
+    def refresh_payload(self, draft=None):
+        payload = build_workbench_payload(
+            settings=self.settings,
+            mapping=self.mapping,
+            week_id=self.week_id,
+            draft=draft,
+            regenerate_note=self.regenerate_note,
+        )
+        payload = self._preserve_runtime_fields(payload)
+        with self.lock:
+            self.payload = payload
             return self.payload
+
+    def get_payload(self):
+        return self.refresh_payload()
 
     def replace_payload(self, payload):
         with self.lock:
@@ -1207,11 +1714,105 @@ def finalize_workbench_archive(state, content):
         mapping=state.mapping,
         week_id=state.week_id,
         draft=content,
+        regenerate_note=state.regenerate_note,
     )
     updated["archived_path"] = str(target)
     updated["should_close"] = True
     state.replace_payload(updated)
     return updated
+
+
+def sync_workbench_week(state):
+    _, week_end = week_bounds_for_id(state.week_id, state.settings["timezone"])
+    sync_sessions(
+        settings=state.settings,
+        current_cwd=str(Path.cwd()),
+        now=week_end,
+    )
+
+
+def regenerate_workbench_draft(state, note):
+    state.regenerate_note = note
+    sync_workbench_week(state)
+    generated = render_weekly_report_draft(
+        prepare_weekly_source(state.week_id, state.mapping, state.settings),
+        guidance=note,
+    )
+    stage_weekly_report(
+        state.settings["data_root"],
+        state.week_id,
+        generated,
+        datetime.now().astimezone(),
+    )
+    updated = build_workbench_payload(
+        settings=state.settings,
+        mapping=state.mapping,
+        week_id=state.week_id,
+        draft=generated,
+        regenerate_note=state.regenerate_note,
+    )
+    state.replace_payload(updated)
+    return updated
+
+
+def dispatch_workbench_post(state, path, payload):
+    try:
+        if path == "/api/draft":
+            content = payload.get("draft", "")
+            stage_weekly_report(
+                state.settings["data_root"],
+                state.week_id,
+                content,
+                datetime.now().astimezone(),
+            )
+            state.replace_payload(
+                build_workbench_payload(
+                    settings=state.settings,
+                    mapping=state.mapping,
+                    week_id=state.week_id,
+                    draft=content,
+                    regenerate_note=state.regenerate_note,
+                )
+            )
+            return state.get_payload(), HTTPStatus.OK, False
+        if path == "/api/regenerate":
+            note = payload.get("note", "")
+            regenerate_workbench_draft(state, note)
+            return state.get_payload(), HTTPStatus.OK, False
+        if path == "/api/mapping":
+            mapping = load_mapping_from_object(payload.get("mapping", {}))
+            save_mapping(state.mapping_path, mapping)
+            state.mapping = mapping
+            state.replace_payload(
+                build_workbench_payload(
+                    settings=state.settings,
+                    mapping=state.mapping,
+                    week_id=state.week_id,
+                    draft=state.get_payload()["draft"],
+                    regenerate_note=state.regenerate_note,
+                )
+            )
+            return state.get_payload(), HTTPStatus.OK, False
+        if path == "/api/git-identity":
+            identity = payload.get("git_identity", {})
+            save_git_identity_map(state.settings["git_identity_path"], identity)
+            state.replace_payload(
+                build_workbench_payload(
+                    settings=state.settings,
+                    mapping=state.mapping,
+                    week_id=state.week_id,
+                    draft=state.get_payload()["draft"],
+                    regenerate_note=state.regenerate_note,
+                )
+            )
+            return state.get_payload(), HTTPStatus.OK, False
+        if path == "/api/archive":
+            content = payload.get("draft", state.get_payload()["draft"])
+            updated = finalize_workbench_archive(state, content)
+            return updated, HTTPStatus.OK, True
+        return {"error": "Not found"}, HTTPStatus.NOT_FOUND, False
+    except Exception as exc:
+        return {"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR, False
 
 
 def create_workbench_handler(state):
@@ -1269,51 +1870,10 @@ def create_workbench_handler(state):
         def do_POST(self):
             parsed = urlparse(self.path)
             payload = self._read_json()
-            if parsed.path == "/api/draft":
-                content = payload.get("draft", "")
-                stage_weekly_report(
-                    state.settings["data_root"],
-                    state.week_id,
-                    content,
-                    datetime.now().astimezone(),
-                )
-                state.replace_payload(
-                    build_workbench_payload(
-                        settings=state.settings,
-                        mapping=state.mapping,
-                        week_id=state.week_id,
-                        draft=content,
-                    )
-                )
-                self._write_json(state.get_payload())
-                return
-            if parsed.path == "/api/regenerate":
-                generated = render_weekly_report_draft(
-                    prepare_weekly_source(state.week_id, state.mapping, state.settings)
-                )
-                stage_weekly_report(
-                    state.settings["data_root"],
-                    state.week_id,
-                    generated,
-                    datetime.now().astimezone(),
-                )
-                state.replace_payload(
-                    build_workbench_payload(
-                        settings=state.settings,
-                        mapping=state.mapping,
-                        week_id=state.week_id,
-                        draft=generated,
-                    )
-                )
-                self._write_json(state.get_payload())
-                return
-            if parsed.path == "/api/archive":
-                content = payload.get("draft", state.get_payload()["draft"])
-                updated = finalize_workbench_archive(state, content)
-                self._write_json(updated)
+            body, status, should_shutdown = dispatch_workbench_post(state, parsed.path, payload)
+            self._write_json(body, status=status)
+            if should_shutdown:
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
-                return
-            self.send_error(HTTPStatus.NOT_FOUND)
 
         def log_message(self, format, *args):
             return
@@ -1321,8 +1881,13 @@ def create_workbench_handler(state):
     return WorkbenchHandler
 
 
-def open_workbench(settings, mapping, week_id, host="127.0.0.1", port=0):
-    state = WorkbenchState(settings=settings, mapping=mapping, week_id=week_id)
+def open_workbench(settings, mapping, mapping_path, week_id, host="127.0.0.1", port=0):
+    state = WorkbenchState(
+        settings=settings,
+        mapping=mapping,
+        mapping_path=mapping_path,
+        week_id=week_id,
+    )
     server = ThreadingHTTPServer((host, port), create_workbench_handler(state))
     return {
         "server": server,
